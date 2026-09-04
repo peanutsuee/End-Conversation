@@ -6,7 +6,9 @@ import { createMcpHandler, McpServer } from '@modelcontextprotocol/server';
 import {
   APP_NAME,
   APP_VERSION,
+  CONVERSATION_STATUS_DESCRIPTION,
   END_MESSAGE,
+  END_CONVERSATION_DESCRIPTION,
   SERVER_INSTRUCTIONS
 } from './constants.js';
 import { getSessionIdFromContext, SessionMetadataError } from './session-metadata.js';
@@ -57,7 +59,7 @@ function buildMcpServer(store) {
     'conversation_status',
     {
       title: 'Conversation status',
-      description: 'Return active or ended for the current ChatGPT conversation.',
+      description: CONVERSATION_STATUS_DESCRIPTION,
       annotations: { readOnlyHint: true }
     },
     (context) => callWithSession(context, (sessionId) => store.getStatus(sessionId))
@@ -67,7 +69,7 @@ function buildMcpServer(store) {
     'end_conversation',
     {
       title: 'End conversation',
-      description: 'Permanently mark the current ChatGPT conversation as ended.',
+      description: END_CONVERSATION_DESCRIPTION,
       annotations: { destructiveHint: true, idempotentHint: true }
     },
     (context) => callWithSession(context, (sessionId) => store.endSession(sessionId).then(() => END_MESSAGE))

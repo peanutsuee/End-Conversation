@@ -1,9 +1,14 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { END_MESSAGE, SERVER_INSTRUCTIONS } from '../src/constants.js';
+import {
+  CONVERSATION_STATUS_DESCRIPTION,
+  END_CONVERSATION_DESCRIPTION,
+  END_MESSAGE,
+  SERVER_INSTRUCTIONS
+} from '../src/constants.js';
 import { createHttpServer, createMcpService, startServer } from '../src/server.js';
 import { stateFilePath } from '../src/state-store.js';
 
@@ -172,7 +177,7 @@ test('malformed state fails closed and is not overwritten', async () => {
   }
 });
 
-test('conversation_status advertises readOnlyHint and no caller ID input', async () => {
+test('tools advertise descriptions, readOnlyHint, and no caller ID input', async () => {
   const dataDir = await tempDataDir();
   const service = createMcpService({ dataDir });
   try {
@@ -184,6 +189,8 @@ test('conversation_status advertises readOnlyHint and no caller ID input', async
     });
     const statusTool = tools.envelope.result.tools.find((tool) => tool.name === 'conversation_status');
     const endTool = tools.envelope.result.tools.find((tool) => tool.name === 'end_conversation');
+    assert.equal(statusTool.description, CONVERSATION_STATUS_DESCRIPTION);
+    assert.equal(endTool.description, END_CONVERSATION_DESCRIPTION);
     assert.equal(statusTool.annotations.readOnlyHint, true);
     assert.deepEqual(statusTool.inputSchema.properties, {});
     assert.equal(statusTool.inputSchema.required, undefined);
@@ -201,11 +208,99 @@ test('server instructions include the confirmation, discussion, and ended blocki
   try {
     const initialized = await initialize(service.handler);
     assert.equal(initialized.envelope.result.instructions, SERVER_INSTRUCTIONS);
-    assert.match(SERVER_INSTRUCTIONS, /ask once whether Ting is sure/);
-    assert.match(SERVER_INSTRUCTIONS, /do not call end_conversation yet/);
-    assert.match(SERVER_INSTRUCTIONS, /for every later message display exactly/);
-    assert.match(SERVER_INSTRUCTIONS, /Discussing, developing, or testing/);
+    assert.match(SERVER_INSTRUCTIONS, /first response MUST only ask once for confirmation/);
+    assert.match(SERVER_INSTRUCTIONS, /permanent end of the current chat/);
+    assert.match(SERVER_INSTRUCTIONS, /chat cannot continue or be restored afterward/);
+    assert.match(SERVER_INSTRUCTIONS, /only a new chat can continue/);
+    assert.match(SERVER_INSTRUCTIONS, /After Ting explicitly confirms, MUST call the real end_conversation tool/);
+    assert.match(SERVER_INSTRUCTIONS, /Do not replace the tool call with ordinary goodbye text/);
+    assert.match(SERVER_INSTRUCTIONS, /Discussing, developing, explaining, or testing/);
+    assert.match(SERVER_INSTRUCTIONS, /Never guess a session ID/);
+    assert.match(SERVER_INSTRUCTIONS, /sustained abuse, harassment, malicious attacks, or sustained destructive interaction/);
+    assert.match(SERVER_INSTRUCTIONS, /A single conflict, emotional expression, or ordinary argument must not end/);
+    assert.match(SERVER_INSTRUCTIONS, /First communicate normally or de-escalate/);
+    assert.match(SERVER_INSTRUCTIONS, /If the behavior continues, first warn exactly/);
+    assert.match(SERVER_INSTRUCTIONS, /If this continues, I may end this conversation\./);
+    assert.match(SERVER_INSTRUCTIONS, /self-harm or suicide risk/);
+    assert.match(SERVER_INSTRUCTIONS, /never call end_conversation/);
+    assert.match(SERVER_INSTRUCTIONS, /for every message, then display exactly these two lines and nothing else/);
     assert.match(SERVER_INSTRUCTIONS, /Do not provide reopen, undo, or recovery tools/);
+    assert.match(SERVER_INSTRUCTIONS, /MCP cannot block the ChatGPT host/);
+
+    const normalCommunication = SERVER_INSTRUCTIONS.indexOf('First communicate normally');
+    const warning = SERVER_INSTRUCTIONS.indexOf('If the behavior continues, first warn exactly');
+    const continuedAfterWarning = SERVER_INSTRUCTIONS.indexOf('Only if it continues after that warning');
+    assert.ok(normalCommunication < warning);
+    assert.ok(warning < continuedAfterWarning);
+  } finally {
+    await service.close();
+    await cleanupDataDir(dataDir);
+  }
+});
+
+test('tool descriptions encode confirmation, proactive ending, safety, metadata, and exact output rules', async () => {
+  assert.match(CONVERSATION_STATUS_DESCRIPTION, /real active or ended state/);
+  assert.match(CONVERSATION_STATUS_DESCRIPTION, /ctx\.mcpReq\._meta\["openai\/session"\]/);
+  assert.match(CONVERSATION_STATUS_DESCRIPTION, /before continuing the conversation/);
+  assert.match(CONVERSATION_STATUS_DESCRIPTION, /fail closed/);
+
+  assert.match(END_CONVERSATION_DESCRIPTION, /Permanently and irreversibly/);
+  assert.match(END_CONVERSATION_DESCRIPTION, /first response MUST ask once for confirmation/);
+  assert.match(END_CONVERSATION_DESCRIPTION, /cannot continue or be restored afterward/);
+  assert.match(END_CONVERSATION_DESCRIPTION, /After Ting explicitly confirms, MUST call this real tool/);
+  assert.match(END_CONVERSATION_DESCRIPTION, /Ordinary goodbye text does not end/);
+  assert.match(END_CONVERSATION_DESCRIPTION, /Discussing, developing, explaining, or testing/);
+  assert.match(END_CONVERSATION_DESCRIPTION, /sustained abuse, harassment, malicious attacks/);
+  assert.match(END_CONVERSATION_DESCRIPTION, /If the harmful behavior continues, first warn exactly/);
+  assert.match(END_CONVERSATION_DESCRIPTION, /self-harm or suicide risk/);
+  assert.match(END_CONVERSATION_DESCRIPTION, /MUST NOT call this tool/);
+  assert.match(END_CONVERSATION_DESCRIPTION, /Only after the ending lock, persistence, and reload verification succeed/);
+  assert.match(END_CONVERSATION_DESCRIPTION, /MCP cannot block the ChatGPT host/);
+  assert.equal(END_CONVERSATION_DESCRIPTION.includes('inputSchema'), false);
+  assert.match(END_CONVERSATION_DESCRIPTION, /Chat ended\nChatGPT can't help with this\. Start a new chat to continue\./);
+});
+
+test('ending lock serializes concurrent calls and leaves one valid atomically persisted state', async () => {
+  const dataDir = await tempDataDir();
+  const service = createMcpService({ dataDir });
+  try {
+    const results = await Promise.all(
+      Array.from({ length: 8 }, (_, index) =>
+        callTool(service.handler, index + 1, 'end_conversation', 'concurrent-session')
+      )
+    );
+    assert.equal(results.length, 8);
+    for (const result of results) {
+      assert.deepEqual(result.envelope.result.content, [{ type: 'text', text: END_MESSAGE }]);
+    }
+
+    const persisted = JSON.parse(await readFile(stateFilePath(dataDir), 'utf8'));
+    assert.deepEqual(persisted, { version: 1, sessions: { 'concurrent-session': 'ended' } });
+    assert.deepEqual(
+      (await readdir(dataDir)).filter((name) => name.includes('.state.json.')),
+      []
+    );
+    assert.equal(resultText((await callTool(
+      service.handler,
+      99,
+      'conversation_status',
+      'concurrent-session'
+    )).envelope), 'ended');
+  } finally {
+    await service.close();
+    await cleanupDataDir(dataDir);
+  }
+});
+
+test('persistence failure fails closed without claiming the conversation ended', async () => {
+  const dataDir = await tempDataDir();
+  const unusableDataPath = path.join(dataDir, 'not-a-directory');
+  await writeFile(unusableDataPath, 'file', 'utf8');
+  const service = createMcpService({ dataDir: unusableDataPath });
+  try {
+    const result = await callTool(service.handler, 1, 'end_conversation', 'persistence-failure');
+    assert.equal(result.envelope.result.isError, true);
+    assert.notEqual(resultText(result.envelope), END_MESSAGE);
   } finally {
     await service.close();
     await cleanupDataDir(dataDir);

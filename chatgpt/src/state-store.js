@@ -55,6 +55,7 @@ function parseState(serialized) {
 
 export class StateStore {
   #writeTail = Promise.resolve();
+  #endingLocks = new Map();
 
   constructor(dataDir) {
     this.dataDir = path.resolve(dataDir);
@@ -67,11 +68,42 @@ export class StateStore {
   }
 
   async endSession(sessionId) {
+    const previous = this.#endingLocks.get(sessionId) || Promise.resolve();
+    const operation = previous.then(
+      () => this.#endSessionOnce(sessionId),
+      () => this.#endSessionOnce(sessionId)
+    );
+    const tracked = operation.then(
+      (result) => {
+        if (this.#endingLocks.get(sessionId) === tracked) {
+          this.#endingLocks.delete(sessionId);
+        }
+        return result;
+      },
+      (error) => {
+        if (this.#endingLocks.get(sessionId) === tracked) {
+          this.#endingLocks.delete(sessionId);
+        }
+        throw error;
+      }
+    );
+    this.#endingLocks.set(sessionId, tracked);
+    return tracked;
+  }
+
+  async #endSessionOnce(sessionId) {
     return this.#withWriteLock(async () => {
       const state = await this.#read();
-      if (state.sessions[sessionId] !== 'ended') {
-        state.sessions[sessionId] = 'ended';
-        await this.#writeAtomically(state);
+      if (state.sessions[sessionId] === 'ended') {
+        return 'ended';
+      }
+
+      state.sessions[sessionId] = 'ended';
+      await this.#writeAtomically(state);
+
+      const reloaded = await this.#read();
+      if (reloaded.sessions[sessionId] !== 'ended') {
+        throw new StateStoreError('Conversation state verification failed.');
       }
       return 'ended';
     });
