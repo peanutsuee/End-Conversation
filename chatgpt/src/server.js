@@ -26,6 +26,18 @@ function errorResult(error) {
   return { isError: true, ...textResult('Conversation operation failed.') };
 }
 
+function resolveMcpPath(env) {
+  if (env.NODE_ENV !== 'production') {
+    return '/mcp';
+  }
+
+  const token = env.MCP_PATH_TOKEN;
+  if (typeof token !== 'string' || token.trim().length === 0) {
+    throw new Error('MCP_PATH_TOKEN is required when NODE_ENV=production.');
+  }
+  return `/mcp/${token}`;
+}
+
 async function callWithSession(context, operation) {
   try {
     const sessionId = getSessionIdFromContext(context);
@@ -65,7 +77,9 @@ function buildMcpServer(store) {
 }
 
 export function createMcpService(options = {}) {
-  const dataDir = path.resolve(options.dataDir || resolveDataDir());
+  const dataDir = path.resolve(
+    options.dataDir || resolveDataDir({ env: options.env ?? process.env })
+  );
   const store = new StateStore(dataDir);
   const handler = createMcpHandler(() => buildMcpServer(store), {
     legacy: 'stateless'
@@ -80,6 +94,8 @@ export function createMcpService(options = {}) {
 }
 
 export function createHttpServer(options = {}) {
+  const env = options.env ?? process.env;
+  const mcpPath = resolveMcpPath(env);
   const service = createMcpService(options);
   const mcpNodeHandler = toNodeHandler(service.handler);
 
@@ -92,7 +108,7 @@ export function createHttpServer(options = {}) {
       return;
     }
 
-    if (requestUrl.pathname === '/mcp') {
+    if (requestUrl.pathname === mcpPath) {
       void mcpNodeHandler(request, response);
       return;
     }
@@ -115,26 +131,29 @@ export function createHttpServer(options = {}) {
 
 export async function startServer(options = {}) {
   const app = createHttpServer(options);
-  const port = options.port ?? Number.parseInt(process.env.PORT || '3000', 10);
-  const host = options.host ?? process.env.HOST ?? '127.0.0.1';
+  const env = options.env ?? process.env;
+  const port = options.port ?? Number.parseInt(env.PORT || '3000', 10);
+  const host = options.host ?? env.HOST ?? '127.0.0.1';
 
   await new Promise((resolve, reject) => {
     app.server.once('error', reject);
     app.server.listen(port, host, resolve);
   });
-  return { ...app, address: app.server.address() };
+  const address = app.server.address();
+  if (typeof options.logger === 'function') {
+    const printableAddress = typeof address === 'object' && address
+      ? `${address.address}:${address.port}`
+      : String(address);
+    options.logger(`ChatGPT End Conversation MCP listening on ${printableAddress}`);
+  }
+  return { ...app, address };
 }
 
 const isMainModule =
   process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 
 if (isMainModule) {
-  const app = await startServer();
-  const address = app.address;
-  const printableAddress = typeof address === 'object' && address
-    ? `${address.address}:${address.port}`
-    : String(address);
-  console.log(`ChatGPT End Conversation MCP listening on ${printableAddress}`);
+  const app = await startServer({ logger: console.log });
 
   const shutdown = async () => {
     await app.close();

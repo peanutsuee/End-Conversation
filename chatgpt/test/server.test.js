@@ -240,3 +240,72 @@ test('HTTP server exposes health and Streamable HTTP at /mcp', async () => {
     await cleanupDataDir(dataDir);
   }
 });
+
+test('production startup fails closed when MCP_PATH_TOKEN is missing', async () => {
+  const dataDir = await tempDataDir();
+  try {
+    await assert.rejects(
+      () => startServer({
+        dataDir,
+        host: '127.0.0.1',
+        port: 0,
+        env: { NODE_ENV: 'production', DATA_DIR: dataDir, PORT: '0', HOST: '127.0.0.1' }
+      }),
+      /MCP_PATH_TOKEN is required when NODE_ENV=production/
+    );
+  } finally {
+    await cleanupDataDir(dataDir);
+  }
+});
+
+test('production serves only the correct secret MCP path and never returns the token', async () => {
+  const dataDir = await tempDataDir();
+  const token = 'test-secret-path-token-7f4e';
+  const logs = [];
+  const app = await startServer({
+    dataDir,
+    host: '127.0.0.1',
+    port: 0,
+    env: { NODE_ENV: 'production', MCP_PATH_TOKEN: token, DATA_DIR: '/data', PORT: '0', HOST: '0.0.0.0' },
+    logger: (message) => logs.push(message)
+  });
+  try {
+    const address = app.server.address();
+    const baseUrl = `http://127.0.0.1:${address.port}`;
+    const mcpMessage = {
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'tools/call',
+      params: { name: 'conversation_status', arguments: {}, _meta: { 'openai/session': 'production-session' } }
+    };
+    const mcpRequest = (pathname) => fetch(`${baseUrl}${pathname}`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(mcpMessage)
+    });
+
+    const correct = await mcpRequest(`/mcp/${token}`);
+    const correctEnvelope = await parseMcpResponse(correct);
+    assert.equal(correct.status, 200);
+    assert.equal(resultText(correctEnvelope), 'active');
+    assert.doesNotMatch(JSON.stringify(correctEnvelope), new RegExp(token));
+
+    const wrong = await mcpRequest('/mcp/wrong-token');
+    const ordinary = await mcpRequest('/mcp');
+    for (const response of [wrong, ordinary]) {
+      const body = await response.text();
+      assert.equal(response.status, 404);
+      assert.doesNotMatch(body, new RegExp(token));
+    }
+
+    const health = await fetch(`${baseUrl}/health`);
+    const healthBody = await health.text();
+    assert.equal(health.status, 200);
+    assert.doesNotMatch(healthBody, new RegExp(token));
+    assert.equal(logs.length, 1);
+    assert.doesNotMatch(logs.join('\n'), new RegExp(token));
+  } finally {
+    await app.close();
+    await cleanupDataDir(dataDir);
+  }
+});
