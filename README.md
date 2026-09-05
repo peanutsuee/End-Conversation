@@ -37,12 +37,22 @@ ChatGPT can't help with this. Start a new chat to continue.
 │   ├── content.js        # 内容脚本入口
 │   ├── test/             # 扩展自动测试
 │   └── README.md         # 安装和测试说明
+├── lan/                  # Lan / Codex Telegram Bridge End Conversation 归档
+│   ├── README.md          # TG 能力、限制和补丁说明
+│   └── patches/           # 针对 Lan-TG-Bridge 的纯 Git diff
+│       └── 0001-add-persistent-end-conversation-support.patch
 ├── Dockerfile            # 从仓库根目录构建 chatgpt/ MCP 服务
 ├── .dockerignore
 └── .gitignore
 ```
 
-`lan/` 目前只是未来规划，尚未创建，也没有复制任何代码。
+`lan/` 只归档 Lan / Codex Telegram Bridge 的 End Conversation 补丁和说明，不复制 TG Bridge 的其他业务代码、配置、runtime 或个人数据。
+
+## Lan / Codex Telegram End Conversation
+
+`lan/` 归档的 TG 实现已经真实验收通过：TG 岚可以通过真实 `end_conversation` dynamic tool 结束当前 native thread，持久化 `endedThreadIds`，中断 active turn，并在 Bridge restart 后继续保持 ended；ended thread 的后续 TG 消息不会进入 Codex，`/new` 会创建新 thread。具体规则、固定结束态和应用方式见 [lan/README.md](lan/README.md)。
+
+Codex Desktop 原生端目前尚未支持真正的 End Conversation：Desktop `turn/start` 不经过 Lan-TG-Bridge，当前公开 plugin/MCP 扩展也不能可靠提供 native thread/turn ID、parent-turn interrupt 或 `turn/start` veto。未来仍需等待官方接口或 Desktop dispatcher 对原生 hard blocking 的支持；必要的 UI 方向也不在本归档补丁内。
 
 ## ChatGPT MCP
 
@@ -113,4 +123,4 @@ npm test
 
 ## 未来规划
 
-`lan/` 预留给未来的岚 End Conversation 模块。目前不创建目录、不复制 ChatGPT 实现，也不把它当作当前可用功能。
+Desktop 原生 hard blocking 与必要的 UI 方向仍待官方接口或未来 Desktop dispatcher 支持。当前不把 Desktop native End Conversation 伪装成已支持功能。

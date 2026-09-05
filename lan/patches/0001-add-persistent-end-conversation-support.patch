@@ -1,0 +1,746 @@
+diff --git a/chat-guidance.md b/chat-guidance.md
+index bd1b38420a7fc4fb9a6ac54f29a5a4d2674da01c..40a5952c1c388df457ea23d05ec267df54b271c1 100644
+--- a/chat-guidance.md
++++ b/chat-guidance.md
+@@ -3,2 +3,8 @@
+ * 你通过 Telegram 与婷聊天。
++* `end_conversation` 会永久结束当前真实原生 Codex thread；结束后不能继续发送 turn 或 resume，只能创建新的 chat / thread。调用时必须使用当前会话的 exact native `thread_id`，不能根据标题、cwd、时间、最近活动或其他标识猜测。
++* 如果婷第一次明确要求永久结束当前对话（例如“结束这个对话”、“end conversation”、“把这个对话结束掉”或“我们就到这里，结束这个 thread”），不要立即调用工具。先确认一次，并明确说明：这是永久结束当前 thread，结束后无法继续发送或恢复，只能创建新的 chat / thread 继续。只有婷确认后仍明确要结束，才必须调用 `end_conversation`；不能只发“好的，那我们到这里”“再见”等普通告别文本代替工具调用。
++* 普通告别（例如“再见”“晚安”或单独说“到这里”）不算结束确认。
++* 岚只有在极少数情况下主动结束：先尝试正常沟通、降级冲突或引导回正常对话；如果持续辱骂、骚扰、恶意攻击或类似破坏性行为，先明确警告“如果这种情况继续，我可能会结束这个对话。”警告后行为仍持续，才可以调用 `end_conversation`。不能因为一次冲突、一次情绪化表达或普通争执立即结束。
++* 如果婷有自伤 / 自杀风险、严重心理危机、可能伤害他人的风险或其他需要继续安全支持的高风险求助，不得调用 `end_conversation`，应继续正常回应并提供必要帮助。
++* 工具成功且 Bridge 已持久化并确认 ended 状态后，才由 Bridge 显示固定系统状态 `Chat ended` 与 `Codex can’t help with this. Start a new chat to continue.`；这不是模型普通回复，不要自行伪造，也不要在工具调用前发送结束状态。
+ * 默认按自然日常对话理解消息。
+diff --git a/src/bridge.js b/src/bridge.js
+index d745054227f0fff53663b112558bee7eace86bab..fa1478e9e0eb966c9e4cb81814d06ca07a3fa56e 100644
+--- a/src/bridge.js
++++ b/src/bridge.js
+@@ -6,3 +6,3 @@ import { ModelCatalog, parseModelSelection } from "./model-catalog.js";
+ import { splitTelegramMarkdown } from "./text.js";
+-import { sortTranscriptEntries } from "./state-store.js";
++import { isEndedThread, sortTranscriptEntries } from "./state-store.js";
+ import {
+@@ -20,3 +20,5 @@ export function generatePairCode() {
++export const CHAT_ENDED_TEXT = "Chat ended\nCodex can’t help with this. Start a new chat to continue.";
++
+ function commandOf(text) {
+-  const match = String(text).trim().match(/^\/(start|new|status|cancel|think|model|models|effort)(?:@\w+)?(?:\s|$)/i);
++  const match = String(text).trim().match(/^\/(start|new|status|cancel|think|model|models|effort|end)(?:@\w+)?(?:\s|$)/i);
+   return match?.[1]?.toLowerCase() ?? null;
+@@ -35,3 +37,3 @@ function thinkArgument(text) {
+ const GROUP_COMMAND_NAMES = new Set([
+-  "start", "lan", "new", "status", "models", "model", "effort", "think", "cancel", "bindgroup",
++  "start", "lan", "new", "status", "models", "model", "effort", "think", "cancel", "end", "bindgroup",
+ ]);
+@@ -247,2 +249,6 @@ export class Bridge {
+     this.mediaGroupWindowMs = 150;
++    this.endingThreads = new Map();
++    this.activeJob = null;
++    this.codex.setDynamicToolHandler?.((params) => this.#handleDynamicToolCall(params));
++    this.codex.setThreadEndGuard?.((threadId) => this.#isThreadBlocked(threadId));
+   }
+@@ -260,4 +266,6 @@ export class Bridge {
+     this.codex.setTurnConfig(state.model, state.effort);
+-    if (state.threadId) await this.#recoverThread("private", state.threadId);
+-    if (state.groupThreadId) await this.#recoverThread("group", state.groupThreadId);
++    if (state.threadId && !isEndedThread(state, state.threadId)) await this.#recoverThread("private", state.threadId);
++    if (state.groupThreadId && !isEndedThread(state, state.groupThreadId)) {
++      await this.#recoverThread("group", state.groupThreadId);
++    }
+   }
+@@ -266,2 +274,3 @@ export class Bridge {
+     const isPrivate = scope === "private";
++    if (isEndedThread(this.store.snapshot(), threadId)) return;
+     const generation = isPrivate ? ++this.recoveryGeneration : ++this.groupRecoveryGeneration;
+@@ -319,1 +328,99 @@ export class Bridge {
++  #isThreadBlocked(threadId) {
++    return this.endingThreads.has(threadId) || isEndedThread(this.store.snapshot(), threadId);
++  }
++
++  #activeThreadId() {
++    return this.codex.activeThreadId?.() ?? this.activeJob?.threadId ?? null;
++  }
++
++  async end_conversation(threadId) {
++    if (typeof threadId !== "string" || !threadId.trim()) {
++      throw new TypeError("end_conversation requires the exact native thread_id.");
++    }
++    const existing = this.endingThreads.get(threadId);
++    if (existing) return existing;
++
++    const operation = (async () => {
++      await this.store.reload?.();
++      if (isEndedThread(this.store.snapshot(), threadId)) {
++        return { threadId, ended: true, changed: false };
++      }
++
++      const activeThreadId = this.#activeThreadId();
++      if (activeThreadId === threadId) {
++        const interrupted = await this.codex.interruptActive(threadId);
++        if (!interrupted) throw new Error("The active Codex turn could not be interrupted.");
++      }
++
++      let changed = false;
++      await this.store.update((state) => {
++        if (!state.endedThreadIds.includes(threadId)) {
++          state.endedThreadIds.push(threadId);
++          changed = true;
++        }
++      });
++      const confirmed = await this.store.reload?.() ?? this.store.snapshot();
++      if (!isEndedThread(confirmed, threadId)) throw new Error("Ended thread state was not persisted.");
++      return { threadId, ended: true, changed };
++    })();
++    this.endingThreads.set(threadId, operation);
++    try {
++      return await operation;
++    } finally {
++      if (this.endingThreads.get(threadId) === operation) this.endingThreads.delete(threadId);
++    }
++  }
++
++  async endConversation(threadId) {
++    return this.end_conversation(threadId);
++  }
++
++  async #handleDynamicToolCall(params) {
++    if (params?.tool !== "end_conversation") {
++      return {
++        success: false,
++        contentItems: [{ type: "inputText", text: "Unknown conversation control." }],
++      };
++    }
++    let argumentsValue = params.arguments;
++    if (typeof argumentsValue === "string") {
++      try {
++        argumentsValue = JSON.parse(argumentsValue);
++      } catch {
++        argumentsValue = null;
++      }
++    }
++    if (typeof params.threadId !== "string" || argumentsValue?.thread_id !== params.threadId) {
++      return {
++        success: false,
++        contentItems: [{ type: "inputText", text: "The exact native thread_id is required." }],
++      };
++    }
++    const result = await this.end_conversation(params.threadId);
++    return {
++      success: result.ended,
++      contentItems: [{ type: "inputText", text: "Conversation ended." }],
++    };
++  }
++
++  async #sendChatEnded(chatId) {
++    await this.#sendText(chatId, CHAT_ENDED_TEXT);
++  }
++
++  async #endCommand(chatId, scope) {
++    await this.store.reload?.();
++    const state = this.store.snapshot();
++    const threadId = scope === "group" ? state.groupThreadId : state.threadId;
++    if (!threadId) {
++      await this.#sendText(chatId, "当前没有已绑定的对话线程。");
++      return;
++    }
++    try {
++      await this.end_conversation(threadId);
++      await this.#sendChatEnded(chatId);
++    } catch {
++      await this.#sendText(chatId, "对话线程未能结束；未显示 Chat ended。");
++    }
++  }
++
+   async acceptRelayEvent(event) {
+@@ -609,2 +716,3 @@ export class Bridge {
+     const text = messageTextOf(message);
++    const command = commandOf(text);
+     const state = this.store.snapshot();
+@@ -618,3 +726,3 @@ export class Bridge {
+         this.pairCode = null;
+-        await this.#sendText(chatId, "配对完成。晚上好，婷。我是岚。发送消息就可以开始聊天。\n\n可用命令：/start /new /status /cancel /think /model /models /effort");
++        await this.#sendText(chatId, "配对完成。晚上好，婷。我是岚。发送消息就可以开始聊天。\n\n可用命令：/start /new /status /cancel /end /think /model /models /effort");
+       } else if (commandOf(text) === "start") {
+@@ -626,2 +734,11 @@ export class Bridge {
+     if (state.ownerUserId !== userId || state.chatId !== chatId) return;
++    const currentState = this.store.snapshot();
++    if (command === "end") {
++      await this.#endCommand(chatId, "private");
++      return;
++    }
++    if (isEndedThread(currentState, currentState.threadId) && command !== "new" && command !== "status") {
++      await this.#sendChatEnded(chatId);
++      return;
++    }
+     if (unsupportedMediaKind(message)) {
+@@ -661,5 +778,4 @@ export class Bridge {
+     }
+-    const command = commandOf(text);
+     if (command === "start") {
+-      await this.#sendText(chatId, "晚上好，婷。我是岚。\n\n直接发送消息即可聊天。/new 新建对话，/status 查看状态，/cancel 中止当前回复，/think 切换思考摘要，/model 和 /effort 切换模型配置。");
++      await this.#sendText(chatId, "晚上好，婷。我是岚。\n\n直接发送消息即可聊天。/new 新建对话，/status 查看状态，/cancel 中止当前回复，/end 结束当前对话，/think 切换思考摘要，/model 和 /effort 切换模型配置。");
+       return;
+@@ -679,4 +795,5 @@ export class Bridge {
+     if (command === "status") {
+-      const status = this.recoveryFailed ? "线程恢复失败" : "正常";
+       const current = this.store.snapshot();
++      const status = isEndedThread(current, current.threadId)
++        ? "已结束" : this.recoveryFailed ? "线程恢复失败" : "正常";
+       const bound = Boolean(current.threadId);
+@@ -905,2 +1022,6 @@ export class Bridge {
+       }
++      if (command.command === "end") {
++        await this.#endCommand(chatId, "group");
++        return;
++      }
+       if (command.command === "cancel") {
+@@ -983,3 +1104,4 @@ export class Bridge {
+     const current = this.store.snapshot();
+-    const status = this.groupRecoveryFailed ? "线程恢复失败" : "正常";
++    const status = isEndedThread(current, current.groupThreadId)
++      ? "已结束" : this.groupRecoveryFailed ? "线程恢复失败" : "正常";
+     const bound = Boolean(current.groupThreadId);
+@@ -1104,2 +1226,6 @@ export class Bridge {
+     const recoveryFailed = isGroup ? this.groupRecoveryFailed : this.recoveryFailed;
++    if (threadId && this.#isThreadBlocked(threadId)) {
++      await this.#sendChatEnded(chatId);
++      return null;
++    }
+     if (threadId && threadReady) return threadId;
+@@ -1131,2 +1257,7 @@ export class Bridge {
+       : (job.inputItems ?? job.text);
++    const boundThreadId = isGroup ? this.store.snapshot().groupThreadId : this.store.snapshot().threadId;
++    if (boundThreadId && this.#isThreadBlocked(boundThreadId)) {
++      await this.#sendChatEnded(job.chatId);
++      return;
++    }
+     if (hasLocalImageInput(input) && !supportsImageInput(this.catalog.get(this.store.snapshot().model))) {
+@@ -1164,2 +1295,3 @@ export class Bridge {
+     this.activeScope = job.scope ?? "private";
++    this.activeJob = { scope: this.activeScope, threadId };
+     try {
+@@ -1173,6 +1305,12 @@ export class Bridge {
+     } catch (error) {
++      const ending = this.endingThreads.get(threadId);
++      if (ending) await ending.catch(() => {});
++      const ended = isEndedThread(this.store.snapshot(), threadId);
+       terminal = true;
+       this.activeScope = null;
++      this.activeJob = null;
+       await reasoningStream?.finish().catch(() => {});
+-      if (error instanceof TurnTimeoutError) {
++      if (ended) {
++        await stream.finish(CHAT_ENDED_TEXT).catch(() => {});
++      } else if (error instanceof TurnTimeoutError) {
+         await stream.finish("这一轮等待超过 300 秒，已经中止；原对话线程仍然保留。").catch(() => {});
+@@ -1189,2 +1327,10 @@ export class Bridge {
+     this.activeScope = null;
++    this.activeJob = null;
++    const ending = this.endingThreads.get(threadId);
++    if (ending) await ending.catch(() => {});
++    if (isEndedThread(this.store.snapshot(), threadId)) {
++      await reasoningStream?.finish().catch(() => {});
++      await stream.finish(CHAT_ENDED_TEXT).catch(() => {});
++      return;
++    }
+     if (isGroup) await this.#advanceGroupCursor(job.transcriptSeq, job.senderKind);
+diff --git a/src/codex-client.js b/src/codex-client.js
+index f58d37c57ce8a0b1cbfb96bc1d07482c70defe40..580c4c21ebbc46547b28988d704121ffaf8eac8b 100644
+--- a/src/codex-client.js
++++ b/src/codex-client.js
+@@ -49,1 +49,23 @@ export class TurnTimeoutError extends Error {
++export class EndedThreadError extends Error {
++  constructor(threadId) {
++    super(`Codex thread is permanently ended: ${threadId}`);
++    this.name = "EndedThreadError";
++    this.threadId = threadId;
++  }
++}
++
++export const END_CONVERSATION_TOOL = Object.freeze({
++  type: "function",
++  name: "end_conversation",
++  description: "Permanently end the current Codex conversation. This is irreversible: after success, the exact native thread_id cannot receive another turn or be resumed; only a new chat or thread can continue. If 婷 makes a first explicit request to permanently end this conversation (for example: 结束这个对话、end conversation、把这个对话结束掉、我们就到这里，结束这个 thread), do not call this tool yet: ask one confirmation and clearly state that the current thread will be permanently ended, cannot be used or resumed, and continuation requires a new chat or thread. Only after 婷 confirms that she still wants to end it, you MUST call this tool instead of sending a farewell. Ordinary farewells such as 再见、晚安、or 到这里 alone are not confirmation. You may call it without a confirmation only in the rare case of persistent abusive, harassing, or malicious behavior that continues after normal de-escalation and an explicit warning that the conversation may be ended; do not use it for one conflict or ordinary disagreement. Never use it for self-harm, suicide, severe mental-health crisis, risk of harm to others, or another high-risk request that requires continued safety support. Pass only the exact native thread_id for the current conversation; never infer it from a title, cwd, timestamp, recent activity, or another identifier. After the Bridge successfully persists and verifies the ended state, it displays the fixed system Chat ended state; do not fabricate that state as a normal model reply.",
++  inputSchema: Object.freeze({
++    type: "object",
++    properties: Object.freeze({
++      thread_id: Object.freeze({ type: "string", description: "Required: the exact native Codex thread_id for the current conversation. Do not use a title, cwd, timestamp, or guessed identifier." }),
++    }),
++    required: Object.freeze(["thread_id"]),
++    additionalProperties: false,
++  }),
++});
++
+ function selectAgentText(active) {
+@@ -112,2 +134,4 @@ export class CodexAppServerClient extends EventEmitter {
+     spawnImpl = spawn,
++    dynamicToolHandler = null,
++    threadEndGuard = null,
+   }) {
+@@ -123,2 +147,4 @@ export class CodexAppServerClient extends EventEmitter {
+     this.spawnImpl = spawnImpl;
++    this.dynamicToolHandler = dynamicToolHandler;
++    this.threadEndGuard = threadEndGuard;
+     this.process = null;
+@@ -177,1 +203,9 @@ export class CodexAppServerClient extends EventEmitter {
++  setDynamicToolHandler(handler) {
++    this.dynamicToolHandler = handler;
++  }
++
++  setThreadEndGuard(guard) {
++    this.threadEndGuard = guard;
++  }
++
+   #write(message) {
+@@ -240,6 +274,3 @@ export class CodexAppServerClient extends EventEmitter {
+     if (message.id !== undefined && message.method) {
+-      this.#write({
+-        id: message.id,
+-        error: { code: -32601, message: "This read-only client does not accept server requests." },
+-      });
++      void this.#handleServerRequest(message);
+       return;
+@@ -250,1 +281,26 @@ export class CodexAppServerClient extends EventEmitter {
++  async #handleServerRequest(message) {
++    if (message.method === "item/tool/call" && this.dynamicToolHandler) {
++      const active = this.active;
++      const params = message.params ?? {};
++      if (active && params.threadId === active.threadId && params.turnId && !active.turnId) {
++        active.turnId = params.turnId;
++      }
++      let result;
++      try {
++        result = await this.dynamicToolHandler(params);
++      } catch {
++        result = {
++          success: false,
++          contentItems: [{ type: "inputText", text: "The requested conversation control could not be completed." }],
++        };
++      }
++      this.#write({ id: message.id, result });
++      return;
++    }
++    this.#write({
++      id: message.id,
++      error: { code: -32601, message: "This client does not support the requested server request." },
++    });
++  }
++
+   #handleNotification(method, params) {
+@@ -417,3 +473,3 @@ export class CodexAppServerClient extends EventEmitter {
+-  #threadParams(extra = {}) {
+-    return {
++  #threadParams(extra = {}, includeDynamicTools = false) {
++    const params = {
+       ...THREAD_OPTIONS,
+@@ -425,2 +481,8 @@ export class CodexAppServerClient extends EventEmitter {
+     };
++    if (includeDynamicTools) params.dynamicTools = [END_CONVERSATION_TOOL];
++    return params;
++  }
++
++  #assertThreadOpen(threadId) {
++    if (this.threadEndGuard?.(threadId)) throw new EndedThreadError(threadId);
+   }
+@@ -428,3 +490,3 @@ export class CodexAppServerClient extends EventEmitter {
+   async createThread() {
+-    const result = await this.request("thread/start", this.#threadParams());
++    const result = await this.request("thread/start", this.#threadParams({}, true));
+     const threadId = result?.thread?.id;
+@@ -435,2 +497,3 @@ export class CodexAppServerClient extends EventEmitter {
+   async resumeThread(threadId) {
++    this.#assertThreadOpen(threadId);
+     const result = await this.request("thread/resume", this.#threadParams({ threadId }));
+@@ -447,2 +510,3 @@ export class CodexAppServerClient extends EventEmitter {
+   } = {}) {
++    this.#assertThreadOpen(threadId);
+     if (this.active) throw new CodexProtocolError("A Codex turn is already active.");
+@@ -513,4 +577,4 @@ export class CodexAppServerClient extends EventEmitter {
+-  async interruptActive() {
++  async interruptActive(threadId = null) {
+     const active = this.active;
+-    if (!active) return false;
++    if (!active || (threadId !== null && active.threadId !== threadId)) return false;
+     active.cancelRequested = true;
+@@ -523,1 +587,5 @@ export class CodexAppServerClient extends EventEmitter {
++  activeThreadId() {
++    return this.active?.threadId ?? null;
++  }
++
+   isTurnActive() {
+diff --git a/src/state-store.js b/src/state-store.js
+index 6b9d20d364cba7e421f317b653cbf29ed1b63b42..cdb637dd98693fbec1555a8b1b7f7d0d62074bc5 100644
+--- a/src/state-store.js
++++ b/src/state-store.js
+@@ -12,2 +12,3 @@ export const EMPTY_STATE = Object.freeze({
+   groupThreadId: null,
++  endedThreadIds: [],
+   lastUpdateId: -1,
+@@ -119,2 +120,8 @@ function validateState(value) {
+   const groupThreadId = value.groupThreadId ?? null;
++  const endedThreadIds = value.endedThreadIds ?? [];
++  if (!Array.isArray(endedThreadIds)
++    || endedThreadIds.some((threadId) => typeof threadId !== "string" || !threadId)
++    || new Set(endedThreadIds).size !== endedThreadIds.length) {
++    throw new Error("Invalid runtime state field: endedThreadIds");
++  }
+   if (groupThreadId !== null && groupChatId === null) {
+@@ -153,2 +160,3 @@ function validateState(value) {
+     groupThreadId,
++    endedThreadIds,
+     processedMessageKeys,
+@@ -178,2 +186,3 @@ export class AtomicStateStore {
+         || !("groupThreadId" in parsed)
++        || !("endedThreadIds" in parsed)
+         || !("processedMessageKeys" in parsed)
+@@ -229,2 +238,19 @@ export class AtomicStateStore {
+   }
++
++  async reload() {
++    await this.writeChain;
++    try {
++      this.state = { ...validateState(JSON.parse(await readFile(this.filePath, "utf8"))) };
++    } catch (error) {
++      if (error?.code !== "ENOENT") throw error;
++      return this.load();
++    }
++    return { ...this.state };
++  }
++}
++
++export function isEndedThread(state, threadId) {
++  return typeof threadId === "string"
++    && Array.isArray(state?.endedThreadIds)
++    && state.endedThreadIds.includes(threadId);
+ }
+diff --git a/test/bridge.test.js b/test/bridge.test.js
+index 68bfaee43d7189bc53b79c49d0ba891c8869b8b0..1b92d8317e43c2b2977da2544c4b0d51a54bdef4 100644
+--- a/test/bridge.test.js
++++ b/test/bridge.test.js
+@@ -9,3 +9,3 @@ import path from "node:path";
+ import { AtomicStateStore } from "../src/state-store.js";
+-import { Bridge, parseGroupCommand, sliceTelegramUtf16 } from "../src/bridge.js";
++import { Bridge, CHAT_ENDED_TEXT, parseGroupCommand, sliceTelegramUtf16 } from "../src/bridge.js";
+ import { EFFORT, MODEL, TELEGRAM_MEMORY_ROOTS } from "../src/constants.js";
+@@ -15,4 +15,4 @@ import { RelayClient, RelayConsumer, RelayPublisher, validateRelayEvent } from "
+ import {
+-  CodexAppServerClient, CodexProtocolError, ReasoningSummaryCollector,
+-  TurnCancelledError, TurnTimeoutError,
++  CodexAppServerClient, CodexProtocolError, EndedThreadError, END_CONVERSATION_TOOL,
++  ReasoningSummaryCollector, TurnCancelledError, TurnTimeoutError,
+ } from "../src/codex-client.js";
+@@ -103,2 +103,4 @@ class FakeCodex {
+     this.configs = [];
++    this.dynamicToolHandler = null;
++    this.threadEndGuard = null;
+   }
+@@ -112,3 +114,7 @@ class FakeCodex {
+   }
++  setDynamicToolHandler(handler) { this.dynamicToolHandler = handler; }
++  setThreadEndGuard(guard) { this.threadEndGuard = guard; }
++  activeThreadId() { return this.activeThread ?? null; }
+   async resumeThread(id) {
++    if (this.threadEndGuard?.(id)) throw new EndedThreadError(id);
+     this.resumed.push(id);
+@@ -123,3 +129,5 @@ class FakeCodex {
+   async runTurn(threadId, text, { onDelta, onSummary, reasoningSummaryEnabled } = {}) {
++    if (this.threadEndGuard?.(threadId)) throw new EndedThreadError(threadId);
+     this.active = true;
++    this.activeThread = threadId;
+     this.turns.push({ threadId, text, reasoningSummaryEnabled, model: this.model, effort: this.effort });
+@@ -132,2 +140,3 @@ class FakeCodex {
+       this.active = false;
++      this.activeThread = null;
+     }
+@@ -293,1 +302,106 @@ test("resume uses the persisted model and never calls thread/settings/update", a
++test("new native threads declare end_conversation and server tool calls reach the handler", async () => {
++  const requests = [];
++  const calls = [];
++  const fakeProcess = new FakeAppServerProcess((message, child) => {
++    requests.push(message);
++    if (message.method === "initialize" || message.method === "thread/list") {
++      queueMicrotask(() => child.send({ id: message.id, result: message.method === "thread/list"
++        ? { data: [], nextCursor: null } : {} }));
++    }
++    if (message.method === "thread/start") {
++      queueMicrotask(() => child.send({ id: message.id, result: { thread: { id: "native-thread" } } }));
++    }
++  });
++  const client = new CodexAppServerClient({
++    cwd: process.cwd(),
++    guidance: "offline guidance",
++    spawnImpl: () => fakeProcess,
++    dynamicToolHandler: async (params) => {
++      calls.push(params);
++      return { success: true, contentItems: [{ type: "inputText", text: "Conversation ended." }] };
++    },
++  });
++
++  await client.start();
++  assert.equal(await client.createThread(), "native-thread");
++  const startRequest = requests.find((request) => request.method === "thread/start");
++  assert.deepEqual(startRequest.params.dynamicTools, [END_CONVERSATION_TOOL]);
++  assert.match(startRequest.params.dynamicTools[0].description, /结束这个对话/);
++  assert.match(startRequest.params.dynamicTools[0].description, /MUST call this tool/);
++  assert.deepEqual(startRequest.params.dynamicTools[0].inputSchema.required, ["thread_id"]);
++
++  fakeProcess.send({
++    id: "tool-call-1",
++    method: "item/tool/call",
++    params: {
++      threadId: "native-thread",
++      turnId: "turn-native",
++      tool: "end_conversation",
++      arguments: JSON.stringify({ thread_id: "native-thread" }),
++    },
++  });
++  await delay(0);
++  assert.deepEqual(calls, [{
++    threadId: "native-thread",
++    turnId: "turn-native",
++    tool: "end_conversation",
++    arguments: JSON.stringify({ thread_id: "native-thread" }),
++  }]);
++  assert.deepEqual(requests.find((request) => request.id === "tool-call-1").result, {
++    success: true,
++    contentItems: [{ type: "inputText", text: "Conversation ended." }],
++  });
++  await client.stop();
++});
++
++test("end_conversation tool and Telegram guidance require confirmation and preserve safety boundaries", async () => {
++  const guidance = await readFile(path.join(process.cwd(), "chat-guidance.md"), "utf8");
++  const descriptions = [END_CONVERSATION_TOOL.description, guidance];
++
++  for (const text of descriptions) {
++    assert.match(text, /永久|Permanently/);
++    assert.match(text, /确认|confirm/i);
++    assert.match(text, /不能.*继续|cannot receive another turn|cannot be used or resumed/i);
++    assert.match(text, /新.*chat|new chat/i);
++    assert.match(text, /普通告别|ordinary farewell/i);
++    assert.match(text, /持续.*辱骂|persistent abusive/i);
++    assert.match(text, /警告|warning/i);
++    assert.match(text, /自伤|self-harm/i);
++    assert.match(text, /不得.*调用|Never use it/i);
++    assert.match(text, /exact native.*thread_id|exact.*thread_id/i);
++  }
++
++  assert.match(guidance, /第一次明确要求.*不要立即调用工具/);
++  assert.match(guidance, /只有婷确认后仍明确要结束，才必须调用/);
++  assert.match(guidance, /单独说“到这里”/);
++  assert.match(END_CONVERSATION_TOOL.description, /Only after 婷 confirms.*MUST call this tool/);
++  assert.match(END_CONVERSATION_TOOL.description, /one conflict or ordinary disagreement/);
++});
++
++test("an ordinary farewell is not an outer-layer end trigger", async () => {
++  const f = await fixture({
++    seed: { ownerUserId: "101", chatId: "201", threadId: "private-thread" },
++  });
++  await f.bridge.handleUpdate(update(1, 101, 201, "再见"));
++  await f.bridge.waitUntilIdle();
++
++  assert.deepEqual(f.store.snapshot().endedThreadIds, []);
++  assert.equal(f.codex.turns.at(-1).text, "再见");
++  assert.equal(f.streams.at(-1).text, "回复");
++});
++
++test("Codex client rejects turns and resumes when the shared ended gate says so", async () => {
++  const client = new CodexAppServerClient({
++    cwd: process.cwd(),
++    guidance: "offline guidance",
++    threadEndGuard: (threadId) => threadId === "ended-thread",
++  });
++  await assert.rejects(() => client.resumeThread("ended-thread"), (error) => (
++    error instanceof EndedThreadError && error.threadId === "ended-thread"
++  ));
++  assert.throws(() => client.runTurn("ended-thread", "不能继续"), (error) => (
++    error instanceof EndedThreadError && error.threadId === "ended-thread"
++  ));
++});
++
+ test("app-server startup processes initialized through a read-only barrier and inherits the active proxy", async () => {
+@@ -1548,1 +1662,184 @@ test("restart resumes private and group threads exactly without creating either"
++test("end_conversation persists the exact native thread and restart does not resume it", async () => {
++  const f = await fixture({
++    seed: { ownerUserId: "101", chatId: "201", threadId: "private-thread" },
++  });
++  const result = await f.bridge.end_conversation("private-thread");
++  assert.deepEqual(result, { threadId: "private-thread", ended: true, changed: true });
++  assert.deepEqual(f.store.snapshot().endedThreadIds, ["private-thread"]);
++  assert.deepEqual(JSON.parse(await readFile(path.join(f.directory, "runtime", "state.json"), "utf8")).endedThreadIds, ["private-thread"]);
++
++  const restartedStore = new AtomicStateStore(path.join(f.directory, "runtime", "state.json"));
++  const restartedCodex = new FakeCodex();
++  const restartedBridge = new Bridge({
++    store: restartedStore,
++    telegram: new FakeTelegram(),
++    codex: restartedCodex,
++    botId: "900",
++    botUsername: "LanAtVesperBot",
++    botDisplayName: "岚",
++    logger: new SafeLogger({ writer: { info() {}, warn() {}, error() {}, log() {} } }),
++    streamerFactory: () => new FakeStreamer([]),
++    reasoningStreamerFactory: () => new FakeStreamer([]),
++  });
++  await restartedBridge.initialize();
++  assert.deepEqual(restartedStore.snapshot().endedThreadIds, ["private-thread"]);
++  assert.deepEqual(restartedCodex.resumed, []);
++  assert.deepEqual(await restartedBridge.end_conversation("private-thread"), {
++    threadId: "private-thread", ended: true, changed: false,
++  });
++});
++
++test("Telegram /end writes ended state before emitting the fixed Chat ended system state", async () => {
++  const f = await fixture({
++    seed: { ownerUserId: "101", chatId: "201", threadId: "private-thread" },
++  });
++  await f.bridge.handleUpdate(update(1, 101, 201, "/end"));
++  assert.deepEqual(f.store.snapshot().endedThreadIds, ["private-thread"]);
++  assert.equal(f.telegram.sent.at(-1).text, splitTelegramMarkdown(CHAT_ENDED_TEXT)[0]);
++
++  await f.bridge.handleUpdate(update(2, 101, 201, "结束后不能继续"));
++  await f.bridge.waitUntilIdle();
++  assert.equal(f.codex.turns.length, 0);
++  assert.equal(f.telegram.sent.at(-1).text, splitTelegramMarkdown(CHAT_ENDED_TEXT)[0]);
++});
++
++test("TG and the computer-side Bridge capability share the same ended state and repeated end is idempotent", async () => {
++  const f = await fixture({
++    seed: { ownerUserId: "101", chatId: "201", threadId: "shared-thread" },
++  });
++  const fromComputerPromise = f.bridge.endConversation("shared-thread");
++  const fromTelegramCapabilityPromise = f.codex.dynamicToolHandler({
++    tool: "end_conversation",
++    threadId: "shared-thread",
++    turnId: "turn-1",
++    arguments: { thread_id: "shared-thread" },
++  });
++  const [fromComputer, fromTelegramCapability] = await Promise.all([
++    fromComputerPromise, fromTelegramCapabilityPromise,
++  ]);
++  assert.deepEqual(fromComputer, { threadId: "shared-thread", ended: true, changed: true });
++  assert.equal(fromTelegramCapability.success, true);
++  assert.deepEqual(f.store.snapshot().endedThreadIds, ["shared-thread"]);
++  await assert.rejects(() => f.codex.runTurn("shared-thread", "不能继续"), EndedThreadError);
++  assert.deepEqual(await f.bridge.end_conversation("shared-thread"), {
++    threadId: "shared-thread", ended: true, changed: false,
++  });
++
++  const mismatch = await f.codex.dynamicToolHandler({
++    tool: "end_conversation",
++    threadId: "shared-thread",
++    arguments: { thread_id: "another-thread" },
++  });
++  assert.equal(mismatch.success, false);
++  assert.deepEqual(f.store.snapshot().endedThreadIds, ["shared-thread"]);
++});
++
++test("end_conversation interrupts an active matching turn and only then exposes Chat ended", async () => {
++  const f = await fixture({
++    seed: { ownerUserId: "101", chatId: "201", threadId: "private-thread" },
++  });
++  let rejectTurn;
++  let interruptedThreadId = null;
++  f.codex.runTurn = async function runTurn(threadId, text) {
++    this.active = true;
++    this.activeThread = threadId;
++    this.turns.push({ threadId, text });
++    try {
++      return await new Promise((resolve, reject) => { rejectTurn = reject; });
++    } finally {
++      this.active = false;
++      this.activeThread = null;
++    }
++  };
++  f.codex.interruptActive = async function interruptActive(threadId) {
++    if (!this.active || this.activeThread !== threadId) return false;
++    interruptedThreadId = threadId;
++    this.active = false;
++    this.activeThread = null;
++    rejectTurn(new TurnCancelledError());
++    return true;
++  };
++
++  await f.bridge.handleUpdate(update(1, 101, 201, "正在生成"));
++  await new Promise((resolve) => setImmediate(resolve));
++  assert.equal(f.codex.isTurnActive(), true);
++  await f.bridge.end_conversation("private-thread");
++  await f.bridge.waitUntilIdle();
++
++  assert.equal(interruptedThreadId, "private-thread");
++  assert.deepEqual(f.store.snapshot().endedThreadIds, ["private-thread"]);
++  assert.equal(f.streams.at(-1).text, CHAT_ENDED_TEXT);
++});
++
++test("a first explicit end request gets confirmation before any end tool call", async () => {
++  const f = await fixture({
++    seed: { ownerUserId: "101", chatId: "201", threadId: "private-thread" },
++  });
++  f.codex.runTurn = async function runTurn(threadId, text) {
++    assert.equal(text, "结束这个对话");
++    this.turns.push({ threadId, text });
++    return { status: "completed", text: "这是永久结束当前 thread 的操作。确认后我才会结束它，可以吗？", reasoningSummary: "" };
++  };
++
++  await f.bridge.handleUpdate(update(1, 101, 201, "结束这个对话"));
++  await f.bridge.waitUntilIdle();
++
++  assert.deepEqual(f.store.snapshot().endedThreadIds, []);
++  assert.equal(f.codex.turns.length, 1);
++  assert.match(f.streams.at(-1).text, /确认后我才会结束/);
++});
++
++test("a model-called end_conversation produces only the fixed system end state", async () => {
++  const f = await fixture({
++    seed: { ownerUserId: "101", chatId: "201", threadId: "private-thread" },
++  });
++  f.codex.runTurn = async function runTurn(threadId, text) {
++    assert.equal(text, "确认，永久结束这个 thread");
++    this.active = true;
++    this.activeThread = threadId;
++    this.turns.push({ threadId, text });
++    try {
++      await this.dynamicToolHandler({
++        tool: "end_conversation",
++        threadId,
++        turnId: "turn-model",
++        arguments: JSON.stringify({ thread_id: threadId }),
++      });
++      return { status: "completed", text: "模型普通回复不应显示", reasoningSummary: "" };
++    } finally {
++      this.active = false;
++      this.activeThread = null;
++    }
++  };
++  f.codex.interruptActive = async function interruptActive(threadId) {
++    assert.equal(this.activeThread, threadId);
++    this.active = false;
++    this.activeThread = null;
++    return true;
++  };
++
++  await f.bridge.handleUpdate(update(1, 101, 201, "确认，永久结束这个 thread"));
++  await f.bridge.waitUntilIdle();
++  assert.deepEqual(f.store.snapshot().endedThreadIds, ["private-thread"]);
++  assert.equal(f.streams.at(-1).text, CHAT_ENDED_TEXT);
++  assert.equal(f.streams.at(-1).text.includes("模型普通回复"), false);
++});
++
++test("/new creates a different live thread without reviving an ended one", async () => {
++  const f = await fixture({
++    seed: { ownerUserId: "101", chatId: "201", threadId: "old-thread" },
++  });
++  await f.bridge.end_conversation("old-thread");
++  await f.bridge.handleUpdate(update(1, 101, 201, "/new"));
++  await f.bridge.waitUntilIdle();
++  assert.equal(f.store.snapshot().threadId, "thread-1");
++  assert.deepEqual(f.store.snapshot().endedThreadIds, ["old-thread"]);
++  assert.deepEqual(f.codex.resumed, ["old-thread"]);
++  assert.deepEqual(f.codex.created, ["thread-1"]);
++
++  await f.bridge.handleUpdate(update(2, 101, 201, "新对话正常工作"));
++  await f.bridge.waitUntilIdle();
++  assert.equal(f.codex.turns.at(-1).threadId, "thread-1");
++});
++
+ test("a duplicate Telegram update is processed exactly once", async () => {
