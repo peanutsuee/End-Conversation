@@ -4,6 +4,9 @@
   const END_MESSAGE =
     "Chat ended\nChatGPT can't help with this. Start a new chat to continue.";
   const STORAGE_PREFIX = 'ended-conversation:';
+  const STORAGE_SCHEMA_KEY = `${STORAGE_PREFIX}schema-version`;
+  const STORAGE_SCHEMA_VERSION = 1;
+  const DOM_STABILITY_MS = 120;
 
   function normalizeMessageText(value) {
     return String(value ?? '')
@@ -46,7 +49,8 @@
   }
 
   function findLatestAssistantMessage(document) {
-    const messages = queryAll(document, '[data-message-author-role="assistant"]');
+    const messages = queryAll(document, '[data-message-author-role="assistant"]')
+      .filter((message) => message && message.isConnected !== false);
     return messages.length > 0 ? messages[messages.length - 1] : null;
   }
 
@@ -104,6 +108,8 @@
     const getLocation = environment.getLocation || (() => window.location);
     const setIntervalFn = environment.setInterval || root.setInterval;
     const clearIntervalFn = environment.clearInterval || root.clearInterval;
+    const setTimeoutFn = environment.setTimeout || root.setTimeout;
+    const clearTimeoutFn = environment.clearTimeout || root.clearTimeout;
     const MutationObserverCtor = environment.MutationObserver || root.MutationObserver;
 
     let started = false;
@@ -119,6 +125,9 @@
     let blockerPanel = null;
     let originalInputState = null;
     let originalRootPosition = null;
+    let migrationReady = false;
+    let transition = null;
+    let transitionTimer = null;
 
     function currentUrl() {
       try {
@@ -151,6 +160,29 @@
       });
     }
 
+    function storageGetAll() {
+      if (!chromeApi?.storage?.local?.get) {
+        return Promise.resolve({});
+      }
+      return new Promise((resolve) => {
+        let settled = false;
+        const finish = (value) => {
+          if (!settled) {
+            settled = true;
+            resolve(value && typeof value === 'object' ? value : {});
+          }
+        };
+        try {
+          const result = chromeApi.storage.local.get(null, finish);
+          if (result && typeof result.then === 'function') {
+            result.then(finish, () => finish({}));
+          }
+        } catch (_error) {
+          finish({});
+        }
+      });
+    }
+
     function storageSet(values) {
       if (!chromeApi?.storage?.local?.set) {
         return Promise.resolve();
@@ -172,6 +204,62 @@
           finish();
         }
       });
+    }
+
+    function storageRemove(keys) {
+      if (!keys || keys.length === 0 || !chromeApi?.storage?.local?.remove) {
+        return Promise.resolve();
+      }
+      return new Promise((resolve) => {
+        let settled = false;
+        const finish = () => {
+          if (!settled) {
+            settled = true;
+            resolve();
+          }
+        };
+        try {
+          const result = chromeApi.storage.local.remove(keys, finish);
+          if (result && typeof result.then === 'function') {
+            result.then(finish, finish);
+          }
+        } catch (_error) {
+          finish();
+        }
+      });
+    }
+
+    function migrateStorage() {
+      return storageGetAll().then((all) => {
+        if (all[STORAGE_SCHEMA_KEY] === STORAGE_SCHEMA_VERSION) {
+          return;
+        }
+        const legacyKeys = Object.keys(all).filter((key) => key.startsWith(STORAGE_PREFIX));
+        return storageRemove(legacyKeys).then(() => storageSet({
+          [STORAGE_SCHEMA_KEY]: STORAGE_SCHEMA_VERSION
+        }));
+      });
+    }
+
+    function nodeIsConnected(node) {
+      if (!node) {
+        return false;
+      }
+      if (typeof node.isConnected === 'boolean') {
+        return node.isConnected;
+      }
+      try {
+        return Boolean(document?.documentElement?.contains?.(node));
+      } catch (_error) {
+        return false;
+      }
+    }
+
+    function clearTransitionTimer() {
+      if (transitionTimer !== null && clearTimeoutFn) {
+        clearTimeoutFn(transitionTimer);
+      }
+      transitionTimer = null;
     }
 
     function restoreBlockedInput() {
@@ -287,50 +375,126 @@
       event.stopPropagation?.();
     }
 
+    function loadStoredState() {
+      if (!migrationReady || !currentConversationId || !transition || transition.storageRequested) {
+        return;
+      }
+      const expectedGeneration = generation;
+      const conversationId = currentConversationId;
+      const key = storageKeyFor(conversationId);
+      transition.storageRequested = true;
+      void storageGet(key).then((stored) => {
+        if (expectedGeneration !== generation || currentConversationId !== conversationId) {
+          return;
+        }
+        storedEnded = stored[key] === true;
+        if (storedEnded) {
+          ended = true;
+          applyBlocker();
+          return;
+        }
+        reconcile();
+      });
+    }
+
+    function finishTransition(expectedTransition) {
+      if (transition !== expectedTransition || expectedTransition.generation !== generation) {
+        return;
+      }
+      const elapsed = Date.now() - expectedTransition.lastMutationAt;
+      if (elapsed < DOM_STABILITY_MS) {
+        scheduleTransitionCheck(DOM_STABILITY_MS - elapsed);
+        return;
+      }
+      if (expectedTransition.previousMessageNode && nodeIsConnected(expectedTransition.previousMessageNode)) {
+        transitionTimer = null;
+        return;
+      }
+      expectedTransition.ready = true;
+      transitionTimer = null;
+      loadStoredState();
+      reconcile();
+    }
+
+    function scheduleTransitionCheck(delay = DOM_STABILITY_MS) {
+      clearTransitionTimer();
+      if (!transition || !setTimeoutFn) {
+        return;
+      }
+      const expectedTransition = transition;
+      transitionTimer = setTimeoutFn(() => {
+        transitionTimer = null;
+        finishTransition(expectedTransition);
+      }, delay);
+    }
+
+    function beginTransition(conversationId) {
+      const previousMessageNode = currentConversationId
+        ? findLatestAssistantMessage(document)
+        : null;
+      currentConversationId = conversationId;
+      generation += 1;
+      storedEnded = false;
+      ended = false;
+      releaseBlocker();
+      clearTransitionTimer();
+      transition = conversationId
+        ? {
+            id: conversationId,
+            generation,
+            previousMessageNode,
+            lastMutationAt: Date.now(),
+            ready: false,
+            storageRequested: false
+          }
+        : null;
+      if (transition) {
+        scheduleTransitionCheck();
+      }
+    }
+
     function reconcile() {
       if (!currentConversationId) {
         ended = false;
         releaseBlocker();
         return;
       }
+      if (storedEnded) {
+        ended = true;
+        applyBlocker();
+        return;
+      }
+      if (!migrationReady || !transition || !transition.ready) {
+        return;
+      }
       const messageEnded = latestAssistantMessageEnded(document);
       if (messageEnded && !storedEnded) {
         storedEnded = true;
+        ended = true;
+        applyBlocker();
         void storageSet({ [storageKeyFor(currentConversationId)]: true });
       }
-      ended = storedEnded || messageEnded;
-      if (ended) {
-        applyBlocker();
-      } else {
+      if (!messageEnded) {
+        ended = false;
         releaseBlocker();
       }
     }
 
-    function refresh() {
+    function refresh({ domChanged = false } = {}) {
       const href = currentUrl();
       const conversationId = extractConversationId(href);
       if (href !== currentHref) {
         currentHref = href;
       }
       if (conversationId !== currentConversationId) {
-        currentConversationId = conversationId;
-        generation += 1;
-        storedEnded = false;
-        ended = false;
-        releaseBlocker();
-        if (!conversationId) {
-          return;
-        }
-        const expectedGeneration = generation;
-        const key = storageKeyFor(conversationId);
-        void storageGet(key).then((stored) => {
-          if (expectedGeneration !== generation || currentConversationId !== conversationId) {
-            return;
-          }
-          storedEnded = stored[key] === true;
-          reconcile();
-        });
+        beginTransition(conversationId);
+      } else if (domChanged && transition && !transition.ready) {
+        transition.lastMutationAt = Date.now();
+        scheduleTransitionCheck();
+      } else if (transition && !transition.ready) {
+        scheduleTransitionCheck();
       }
+      loadStoredState();
       reconcile();
     }
 
@@ -346,7 +510,7 @@
         window.addEventListener?.(eventName, refresh);
       }
       if (MutationObserverCtor && document.documentElement) {
-        observer = new MutationObserverCtor(refresh);
+        observer = new MutationObserverCtor(() => refresh({ domChanged: true }));
         observer.observe(document.documentElement, {
           childList: true,
           characterData: true,
@@ -357,6 +521,13 @@
         intervalId = setIntervalFn(refresh, 500);
       }
       refresh();
+      void migrateStorage().then(() => {
+        migrationReady = true;
+        refresh();
+      }, () => {
+        migrationReady = true;
+        refresh();
+      });
       return controller;
     }
 
@@ -376,6 +547,7 @@
         clearIntervalFn(intervalId);
       }
       intervalId = null;
+      clearTransitionTimer();
       releaseBlocker();
     }
 
@@ -393,12 +565,15 @@
   }
 
   root.EndConversationCore = Object.freeze({
+    DOM_STABILITY_MS,
     END_MESSAGE,
     extractConversationId,
     findLatestAssistantMessage,
     isExactEndedMessage,
     latestAssistantMessageEnded,
     normalizeMessageText,
+    STORAGE_SCHEMA_KEY,
+    STORAGE_SCHEMA_VERSION,
     storageKeyFor,
     createController
   });

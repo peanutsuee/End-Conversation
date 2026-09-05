@@ -128,17 +128,13 @@ class FakeDocument extends FakeEventTarget {
   }
 }
 
-class FakeMutationObserver {
-  constructor(callback) {
-    this.callback = callback;
-  }
-
-  observe() {}
-
-  disconnect() {}
-}
-
-function createPage({ conversationId = 'conversation-a', ended = false } = {}) {
+function createPage({
+  conversationId = 'conversation-a',
+  ended = false,
+  storedEnded = ended,
+  schemaVersion = 1,
+  storage: suppliedStorage
+} = {}) {
   const document = new FakeDocument();
   const form = new FakeElement('form');
   const composer = new FakeElement('textarea');
@@ -151,8 +147,12 @@ function createPage({ conversationId = 'conversation-a', ended = false } = {}) {
     ? "Chat ended\nChatGPT can't help with this. Start a new chat to continue."
     : 'Normal response';
   document.assistantMessages = [assistant];
-  const storage = new Map();
-  if (ended) {
+  const storage = suppliedStorage || new Map();
+  const { core } = loadCore();
+  if (schemaVersion !== undefined) {
+    storage.set(core.STORAGE_SCHEMA_KEY, schemaVersion);
+  }
+  if (storedEnded) {
     storage.set(`ended-conversation:${conversationId}`, true);
   }
   const window = new FakeEventTarget();
@@ -160,31 +160,68 @@ function createPage({ conversationId = 'conversation-a', ended = false } = {}) {
   const chrome = {
     storage: {
       local: {
-        get: (key) => Promise.resolve({ [key]: storage.get(key) }),
+        get: (key) => {
+          if (key === null) {
+            return Promise.resolve(Object.fromEntries(storage.entries()));
+          }
+          return Promise.resolve({ [key]: storage.get(key) });
+        },
         set: (values) => {
           for (const [key, value] of Object.entries(values)) {
             storage.set(key, value);
+          }
+          return Promise.resolve();
+        },
+        remove: (keys) => {
+          for (const key of keys) {
+            storage.delete(key);
           }
           return Promise.resolve();
         }
       }
     }
   };
-  const { core } = loadCore();
+  let mutationObserverCallback = null;
+  class TestMutationObserver {
+    constructor(callback) {
+      mutationObserverCallback = callback;
+    }
+
+    observe() {}
+
+    disconnect() {}
+  }
   const controller = core.createController({
     document,
     window,
     chrome,
-    MutationObserver: FakeMutationObserver,
+    MutationObserver: TestMutationObserver,
     setInterval: () => 1,
-    clearInterval: () => {}
+    clearInterval: () => {},
+    setTimeout,
+    clearTimeout
   });
-  return { controller, document, form, composer, assistant, storage, window, core };
+  return {
+    controller,
+    document,
+    form,
+    composer,
+    assistant,
+    storage,
+    window,
+    core,
+    triggerMutation: () => mutationObserverCallback?.()
+  };
 }
 
 async function settle() {
   await Promise.resolve();
   await Promise.resolve();
+}
+
+async function waitForStableDom(page) {
+  await new Promise((resolve) => setTimeout(resolve, page.core.DOM_STABILITY_MS + 40));
+  await settle();
 }
 
 test('extracts only stable ChatGPT conversation IDs', () => {
@@ -230,9 +267,9 @@ test('only the latest assistant message can trigger ended', () => {
 });
 
 test('ended conversation persists and active conversation remains unblocked', async () => {
-  const endedPage = createPage({ ended: true });
+  const endedPage = createPage({ ended: true, storedEnded: false });
   endedPage.controller.start();
-  await settle();
+  await waitForStableDom(endedPage);
   assert.equal(endedPage.controller.getState().conversationId, 'conversation-a');
   assert.equal(endedPage.controller.getState().ended, true);
   assert.equal(endedPage.controller.getState().blocked, true);
@@ -241,7 +278,7 @@ test('ended conversation persists and active conversation remains unblocked', as
 
   const activePage = createPage({ conversationId: 'conversation-b', ended: false });
   activePage.controller.start();
-  await settle();
+  await waitForStableDom(activePage);
   assert.equal(activePage.controller.getState().conversationId, 'conversation-b');
   assert.equal(activePage.controller.getState().ended, false);
   assert.equal(activePage.controller.getState().blocked, false);
@@ -249,29 +286,98 @@ test('ended conversation persists and active conversation remains unblocked', as
 });
 
 test('SPA navigation and refresh do not cross-contaminate conversation state', async () => {
-  const page = createPage({ conversationId: 'conversation-a', ended: true });
+  const page = createPage({ conversationId: 'conversation-a', ended: true, storedEnded: false });
   page.controller.start();
-  await settle();
+  await waitForStableDom(page);
   assert.equal(page.controller.getState().blocked, true);
 
   page.window.location.href = 'https://chatgpt.com/c/conversation-b';
-  page.assistant.innerText = 'Normal response';
   page.controller.refresh();
   await settle();
   assert.equal(page.controller.getState().conversationId, 'conversation-b');
   assert.equal(page.controller.getState().ended, false);
   assert.equal(page.controller.getState().blocked, false);
 
+  await waitForStableDom(page);
+  assert.equal(page.storage.get('ended-conversation:conversation-b'), undefined);
+
+  page.assistant.isConnected = false;
+  const activeB = new FakeElement('div');
+  activeB.setAttribute('data-message-author-role', 'assistant');
+  activeB.innerText = 'Normal response';
+  page.document.assistantMessages = [activeB];
+  page.triggerMutation();
+  await waitForStableDom(page);
+  assert.equal(page.controller.getState().ended, false);
+  assert.equal(page.controller.getState().blocked, false);
+  assert.equal(page.storage.get('ended-conversation:conversation-b'), undefined);
+
+  const reloadedB = createPage({
+    conversationId: 'conversation-b',
+    ended: false,
+    storage: page.storage
+  });
+  reloadedB.controller.start();
+  await waitForStableDom(reloadedB);
+  assert.equal(reloadedB.controller.getState().ended, false);
+  assert.equal(reloadedB.controller.getState().blocked, false);
+  reloadedB.controller.stop();
+
   page.window.location.href = 'https://chatgpt.com/c/conversation-a';
+  activeB.isConnected = false;
+  const endedA = new FakeElement('div');
+  endedA.setAttribute('data-message-author-role', 'assistant');
+  endedA.innerText = "Chat ended\nChatGPT can't help with this. Start a new chat to continue.";
+  page.document.assistantMessages = [endedA];
   page.controller.refresh();
   await settle();
   assert.equal(page.controller.getState().blocked, true);
 });
 
+test('one-time migration clears v0.1.0 ended IDs and preserves the active chat', async () => {
+  const page = createPage({
+    conversationId: 'conversation-b',
+    ended: false,
+    storedEnded: true,
+    schemaVersion: 0
+  });
+  page.controller.start();
+  await waitForStableDom(page);
+  assert.equal(page.storage.get('ended-conversation:conversation-b'), undefined);
+  assert.equal(page.storage.get(page.core.STORAGE_SCHEMA_KEY), page.core.STORAGE_SCHEMA_VERSION);
+  assert.equal(page.controller.getState().ended, false);
+  assert.equal(page.controller.getState().blocked, false);
+});
+
+test('active conversations can switch repeatedly without sharing ended state', async () => {
+  const page = createPage({ conversationId: 'conversation-a', ended: false });
+  page.controller.start();
+  await waitForStableDom(page);
+
+  for (const conversationId of ['conversation-b', 'conversation-c']) {
+    page.window.location.href = `https://chatgpt.com/c/${conversationId}`;
+    page.controller.refresh();
+    assert.equal(page.controller.getState().blocked, false);
+    assert.equal(page.storage.get(`ended-conversation:${conversationId}`), undefined);
+
+    const oldAssistant = page.document.assistantMessages[0];
+    oldAssistant.isConnected = false;
+    const nextAssistant = new FakeElement('div');
+    nextAssistant.setAttribute('data-message-author-role', 'assistant');
+    nextAssistant.innerText = 'Normal response';
+    page.document.assistantMessages = [nextAssistant];
+    page.triggerMutation();
+    await waitForStableDom(page);
+    assert.equal(page.controller.getState().ended, false);
+    assert.equal(page.controller.getState().blocked, false);
+    assert.equal(page.storage.get(`ended-conversation:${conversationId}`), undefined);
+  }
+});
+
 test('Enter, click, submit, paste, and editing events are blocked only in ended composer', async () => {
   const endedPage = createPage({ ended: true });
   endedPage.controller.start();
-  await settle();
+  await waitForStableDom(endedPage);
   for (const type of ['keydown', 'click', 'submit', 'paste', 'beforeinput', 'input', 'drop']) {
     const event = {
       target: endedPage.composer,
@@ -288,7 +394,7 @@ test('Enter, click, submit, paste, and editing events are blocked only in ended 
 
   const activePage = createPage({ ended: false });
   activePage.controller.start();
-  await settle();
+  await waitForStableDom(activePage);
   const event = {
     target: activePage.composer,
     prevented: false,
